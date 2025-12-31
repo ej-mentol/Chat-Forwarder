@@ -1,0 +1,41 @@
+# Build artifacts
+Debug/
+Release/
+Release_AVX2/
+x64/
+.vs/
+*.user
+*.aps
+*.ncb
+*.suo
+*.sdf
+*.opensdf
+*.pdb
+*.iobj
+*.ipdb
+*.lib
+*.exp
+*.dll
+*.ilk
+
+# Release archives
+Builds/
+
+# Logs and support
+support/
+*.log
+conout.txt
+
+# Archives
+*.rar
+*.zip
+*.7z
+
+# Temp files
+*.tmp
+*.bak
+*_bak
+
+# OS generated
+Thumbs.db
+Desktop.ini
