@@ -67,5 +67,3 @@ A standalone build script is included to compile the project without needing the
 ## Tools
 
 *   `udp_test_client.py`: A simple Python script (no dependencies required) to act as a receiver/sender for testing the plugin.
-
-```
