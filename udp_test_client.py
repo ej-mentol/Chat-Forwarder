@@ -9,8 +9,13 @@ import os
 # CONFIGURATION
 # ==============================================================================
 SERVER_IP = "127.0.0.1"
-SEND_PORT = 26000
-LISTEN_PORT = 26001
+# Port to SEND commands TO (Must match 'cf_listen_port' in game)
+# Default: 26001
+SEND_PORT = 26001
+
+# Port to LISTEN for messages FROM (Must match 'cf_server_port' in game)
+# Default: 26000
+LISTEN_PORT = 26000
 SHOW_TYPES = []
 
 # ==============================================================================
@@ -44,36 +49,32 @@ def enable_ansi_windows():
 
 def parse_goldsrc_colors(data_bytes):
     """
-    Converts GoldSrc bytes (0x01-0x04) to ANSI escape codes.
+    Converts GoldSrc bytes (0x01-0x04) to ANSI escape codes while preserving UTF-8.
     """
-    output = ""
-    # We iterate byte by byte
-    i = 0
-    length = len(data_bytes)
+    res_bytes = bytearray()
     
-    while i < length:
-        byte = data_bytes[i]
-        
-        if byte == 0x01:   # Normal
-            output += ANSI_NORMAL
-        elif byte == 0x02: # Name / Color 2
-            output += ANSI_NAME
-        elif byte == 0x03: # Team / Color 3
-            output += ANSI_TEAM
-        elif byte == 0x04: # Green
-            output += ANSI_GREEN
+    # ANSI sequences as bytes
+    mapping = {
+        0x01: ANSI_NORMAL.encode('utf-8'),
+        0x02: ANSI_NAME.encode('utf-8'),
+        0x03: ANSI_TEAM.encode('utf-8'),
+        0x04: ANSI_GREEN.encode('utf-8'),
+    }
+    
+    for byte in data_bytes:
+        if byte in mapping:
+            res_bytes.extend(mapping[byte])
         elif byte == 0x0A: # Newline
-            output += '\n'
+            res_bytes.extend(b"\n")
         elif byte == 0x0D: # CR
             pass
-        elif byte < 0x20:  # Other control chars -> replace or skip
-            pass
-        else:
-            # Standard char
-            output += chr(byte)
-        i += 1
+        elif byte >= 0x20 or byte > 0x7F: # Printable or UTF-8 lead/trail bytes
+            res_bytes.append(byte)
             
-    return output + ANSI_RESET # Ensure reset at end
+    try:
+        return res_bytes.decode('utf-8', errors='replace') + ANSI_RESET
+    except Exception:
+        return res_bytes.decode('latin-1', errors='replace') + ANSI_RESET
 
 def listener_thread(stop_event):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
