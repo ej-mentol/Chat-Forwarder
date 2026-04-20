@@ -184,7 +184,9 @@ bool SenderWorkCallback(void* ctx) {
     } socketGuard(sock);
 
     while (!g_shutdownSender.load(std::memory_order_relaxed)) {
-        if (!IsCvarValid(cf_enabled) || atoi(cf_enabled->string) == 0) {
+        // Pause if plugin is disabled OR if listen-only mode is active
+        if (!IsCvarValid(cf_enabled) || atoi(cf_enabled->string) == 0 ||
+            (IsCvarValid(cf_listen_only) && atoi(cf_listen_only->string) != 0)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
@@ -197,11 +199,12 @@ bool SenderWorkCallback(void* ctx) {
                 sockaddr_in addr = {};
                 addr.sin_family = AF_INET;
                 addr.sin_port = htons(task.port);
-                inet_pton(AF_INET, task.server_ip, &addr.sin_addr);
-
+                // If the IP is invalid (e.g. cvar not yet set), skip this task
+                if (inet_pton(AF_INET, task.server_ip, &addr.sin_addr) != 1) {
+                    continue;
+                }
                 sendto(sock, task.message, strlen(task.message), 0,
                     (const sockaddr*)&addr, sizeof(addr));
-            
             } while (g_sendQueue.pop(task, 0)); // Pop instantly until empty
         }
     }
@@ -211,19 +214,34 @@ bool SenderWorkCallback(void* ctx) {
 
 void CleanupResources()
 {
+    // 1. Signal all worker threads to stop
     g_shutdownListener.store(true, std::memory_order_release);
     g_shutdownSender.store(true, std::memory_order_release);
 
+    // 2. Wake up threads blocked on condition_variable so they exit immediately
+    //    instead of waiting for the next pop/push timeout
+    g_sendQueue.shutdown();
+    g_messageQueue.shutdown();
+
+    // 3. Wait for listener thread to finish, then release its MetaHook work item
     if (g_hListenerWorkItem) {
+        if (g_pMetaHookAPI && g_hThreadPool) {
+            g_pMetaHookAPI->WaitForWorkItemToComplete(g_hListenerWorkItem);
+            g_pMetaHookAPI->DeleteWorkItem(g_hListenerWorkItem);
+        }
         g_hListenerWorkItem = nullptr;
     }
 
+    // 4. Wait for sender thread to finish, then release its MetaHook work item
     if (g_hSenderWorkItem) {
+        if (g_pMetaHookAPI && g_hThreadPool) {
+            g_pMetaHookAPI->WaitForWorkItemToComplete(g_hSenderWorkItem);
+            g_pMetaHookAPI->DeleteWorkItem(g_hSenderWorkItem);
+        }
         g_hSenderWorkItem = nullptr;
     }
 
-    g_messageQueue.clear();
-    g_sendQueue.clear();
+    // 5. Release Winsock
     g_winsock.reset();
 }
 void ChatForwarder_Init(void)
@@ -282,8 +300,10 @@ void ChatForwarder_Init(void)
         return;
     }
 
-    // Restart Sender Thread if not running
-    if (!g_hSenderWorkItem) {
+    // Start Sender thread only if NOT in listen-only mode.
+    // cf_listen_only=1 means: accept inbound commands, but send nothing outbound.
+    // Runtime blocking is also handled inside SenderWorkCallback.
+    if (!g_hSenderWorkItem && (!IsCvarValid(cf_listen_only) || atoi(cf_listen_only->string) == 0)) {
         g_shutdownSender.store(false, std::memory_order_relaxed);
         g_hSenderWorkItem = g_pMetaHookAPI->CreateWorkItem(g_hThreadPool, SenderWorkCallback, nullptr);
 
@@ -296,9 +316,9 @@ void ChatForwarder_Init(void)
         g_pMetaHookAPI->QueueWorkItem(g_hThreadPool, g_hSenderWorkItem);
     }
 
-    // Restart Listener Thread if not running (and allowed)
-    if ((!IsCvarValid(cf_listen_only) || atoi(cf_listen_only->string) == 0) && !g_hListenerWorkItem)
-    {
+    // Always start the Listener thread — it handles inbound console commands
+    // regardless of cf_listen_only mode.
+    if (!g_hListenerWorkItem) {
         g_shutdownListener.store(false, std::memory_order_relaxed);
         g_hListenerWorkItem = g_pMetaHookAPI->CreateWorkItem(g_hThreadPool, UDPListenerWorkCallback, nullptr);
 

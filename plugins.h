@@ -24,12 +24,6 @@ constexpr int SOCKET_TIMEOUT_MS = 500;
 constexpr int THREAD_JOIN_TIMEOUT_MS = 2000;
 
 // Structs
-struct SenderWorkContext {
-    char message[1024];
-    char server_ip[256];
-    char server_port[16];
-};
-
 struct SendTask {
     char message[1024];
     char server_ip[256];

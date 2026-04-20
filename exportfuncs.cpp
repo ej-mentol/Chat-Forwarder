@@ -33,11 +33,13 @@ fn_parsefunc g_pfnCL_ParseStuffText = NULL;
 
 void QueueTask(char tag, const std::string& msg) {
     if (msg.empty()) return;
+    // Cvars may not be registered yet (e.g., called before HUD_Init completes)
+    if (!IsCvarValid(cf_server_ip) || !IsCvarValid(cf_server_port)) return;
 
     std::string fullMsg;
     fullMsg += tag;
     fullMsg += msg;
-    
+
     SendTask task;
     strncpy_s(task.message, fullMsg.c_str(), sizeof(task.message) - 1);
     strncpy_s(task.server_ip, cf_server_ip->string, sizeof(task.server_ip) - 1);
@@ -80,11 +82,18 @@ void HUD_Init(void) {
         g_pfnHUD_Init();
     }
 
-    g_pfnSayText = g_pMetaHookAPI->HookUserMsg("SayText", __MsgFunc_SayText);
-    g_pfnTextMsg = g_pMetaHookAPI->HookUserMsg("TextMsg", __MsgFunc_TextMsg);
-
-    g_pfnCL_ParsePrint = g_pMetaHookAPI->HookCLParseFuncByName("print", __MsgFunc_Print);
-    g_pfnCL_ParseStuffText = g_pMetaHookAPI->HookCLParseFuncByName("stufftext", __MsgFunc_StuffText);
+    // HUD_Init is called on every map load / reconnect.
+    // HookUserMsg and HookCLParseFuncByName must only be called once:
+    // calling them again would cause the returned "previous" pointer to point
+    // back to our own hook, creating infinite recursion.
+    static bool bHooksInstalled = false;
+    if (!bHooksInstalled) {
+        g_pfnSayText           = g_pMetaHookAPI->HookUserMsg("SayText", __MsgFunc_SayText);
+        g_pfnTextMsg           = g_pMetaHookAPI->HookUserMsg("TextMsg", __MsgFunc_TextMsg);
+        g_pfnCL_ParsePrint     = g_pMetaHookAPI->HookCLParseFuncByName("print",      __MsgFunc_Print);
+        g_pfnCL_ParseStuffText = g_pMetaHookAPI->HookCLParseFuncByName("stufftext",  __MsgFunc_StuffText);
+        bHooksInstalled = true;
+    }
 }
 
 void HUD_Frame(double time) {
@@ -115,15 +124,20 @@ void HUD_Frame(double time) {
 }
 
 int __MsgFunc_SayText(const char* pszName, int iSize, void* pbuf) {
-    if (!IsCvarValid(cf_enabled) || atoi(cf_enabled->string) == 0) return g_pfnSayText(pszName, iSize, pbuf);
+    // Null-safe passthrough: HookUserMsg may return NULL if message wasn't registered
+    auto callOriginal = [&]() -> int {
+        return g_pfnSayText ? g_pfnSayText(pszName, iSize, pbuf) : 1;
+    };
+
+    if (!IsCvarValid(cf_enabled) || atoi(cf_enabled->string) == 0) return callOriginal();
 
     char temp_buf[1024];
-    if (iSize >= sizeof(temp_buf)) return g_pfnSayText(pszName, iSize, pbuf);
+    if (iSize >= sizeof(temp_buf)) return callOriginal();
     memcpy(temp_buf, pbuf, iSize);
 
     BEGIN_READ(temp_buf, iSize);
     READ_BYTE(); // client index
-    
+
     char* msg_base = READ_STRING();
     std::string fullMsg = msg_base ? CleanMessage(msg_base) : "";
 
@@ -144,12 +158,17 @@ int __MsgFunc_SayText(const char* pszName, int iSize, void* pbuf) {
         QueueTask(MSG_TYPE_CHAT, fullMsg);
     }
 
-    return g_pfnSayText(pszName, iSize, pbuf);
+    return callOriginal();
 }
 
 int __MsgFunc_TextMsg(const char* pszName, int iSize, void* pbuf) {
+    // Null-safe passthrough: HookUserMsg may return NULL if message wasn't registered
+    auto callOriginal = [&]() -> int {
+        return g_pfnTextMsg ? g_pfnTextMsg(pszName, iSize, pbuf) : 1;
+    };
+
     char temp_buf[1024];
-    if (iSize >= sizeof(temp_buf)) return g_pfnTextMsg(pszName, iSize, pbuf);
+    if (iSize >= sizeof(temp_buf)) return callOriginal();
     memcpy(temp_buf, pbuf, iSize);
 
     BEGIN_READ(temp_buf, iSize);
@@ -174,5 +193,5 @@ int __MsgFunc_TextMsg(const char* pszName, int iSize, void* pbuf) {
             QueueTask(MSG_TYPE_GAME, fullMsg);
         }
     }
-    return g_pfnTextMsg(pszName, iSize, pbuf);
+    return callOriginal();
 }
