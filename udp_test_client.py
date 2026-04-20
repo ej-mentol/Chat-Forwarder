@@ -18,17 +18,13 @@ LISTEN_PORT = 26000
 # Filter to specific tag types (empty = show all)
 SHOW_TYPES = []
 
-# Deduplication: suppress messages with identical text content arriving within
-# this window. Handles loopback where the same event fires in both [SYS]
-# (OutputDebugString) and [CHAT]/[GAME] (UserMsg) simultaneously.
+# Deduplication: suppress ANY messages with identical text content arriving
+# within an extremely short window. GoldSrc engine loopbacks on Listen Servers
+# fire the same text across multiple hooks (e.g. SYS, CHAT, SYS again) in the
+# same physical frame (0.00s delay).
 # Set DEDUP_WINDOW to 0 to disable.
 DEDUP_ENABLED = True
-DEDUP_WINDOW  = 0.25   # seconds
-
-# Only tags listed here can be silently dropped as duplicates.
-# CHAT/GAME/NET/STUFF are never suppressed — they are the "authoritative" source.
-# SYS (0x15) is suppressed because it echoes almost everything the engine does.
-DEDUP_SUPPRESS_TAGS = {0x15}  # SYS only
+DEDUP_WINDOW  = 0.05   # 50ms window
 
 # ==============================================================================
 # CONSTANTS & MAPPING
@@ -69,22 +65,11 @@ def _content_key(payload: bytes) -> bytes:
     stripped = bytes(b for b in payload if b >= 0x20)
     return stripped.strip().lower()
 
-def is_duplicate(tag_byte: int, payload: bytes) -> bool:
+def is_duplicate(payload: bytes) -> bool:
     """
-    Returns True only if:
-      1. The same content was registered in the dedup buffer recently, AND
-      2. This tag type is in DEDUP_SUPPRESS_TAGS.
-
-    All tags register their content so they can suppress future [SYS] arrivals,
-    but only tags in DEDUP_SUPPRESS_TAGS are ever dropped themselves.
-
-    This means:
-      SYS arrives first  → registered → shown
-      CHAT arrives 2ms later → found in buf → NOT in suppress list → shown ✓
-      SYS arrives again  → found in buf → in suppress list → DROPPED ✓
-
-      CHAT arrives first → registered → shown
-      SYS arrives 2ms later → found in buf → in suppress list → DROPPED ✓
+    Returns True if the exact same content was seen within DEDUP_WINDOW (e.g. 50ms).
+    This cleanly drops any Listen Server loopbacks (SYS + CHAT + SYS)
+    while keeping legitimate human spam (which physicaly takes >150ms).
     """
     if not DEDUP_ENABLED or DEDUP_WINDOW <= 0:
         return False
@@ -97,14 +82,14 @@ def is_duplicate(tag_byte: int, payload: bytes) -> bool:
         while _dedup_buf and now - _dedup_buf[0][0] > DEDUP_WINDOW:
             _dedup_buf.popleft()
 
-        found = any(k == key for _, k in _dedup_buf)
+        # Check for exact match
+        for ts, k in _dedup_buf:
+            if k == key:
+                return True
 
-        # Always register if not already present (so future SYS can be suppressed)
-        if not found:
-            _dedup_buf.append((now, key))
-
-        # Only suppress if the content was seen before AND this tag is suppressible
-        return found and (tag_byte in DEDUP_SUPPRESS_TAGS)
+        # Not a duplicate – register it
+        _dedup_buf.append((now, key))
+        return False
 
 # ==============================================================================
 # ANSI / DISPLAY
@@ -173,9 +158,9 @@ def listener_thread(stop_event: threading.Event):
             if SHOW_TYPES and tag_byte not in SHOW_TYPES:
                 continue
 
-            # Deduplication: SYS is dropped if the same content already
-            # arrived (or will arrive) from a higher-priority tag.
-            if is_duplicate(tag_byte, payload):
+            # Deduplication: block if the exact stripped text was shown
+            # in the last DEDUP_WINDOW seconds.
+            if is_duplicate(payload):
                 continue
 
             timestamp     = f"{ANSI_GREY}[{datetime.datetime.now().strftime('%H:%M:%S')}]{ANSI_RESET}"
