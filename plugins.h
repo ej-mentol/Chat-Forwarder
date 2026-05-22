@@ -248,6 +248,7 @@ extern SendQueue g_sendQueue;
 
 extern cvar_t* cf_server_ip;
 extern cvar_t* cf_server_port;
+extern cvar_t* cf_allow_ip;
 extern cvar_t* cf_listen_port;
 extern cvar_t* cf_enabled;
 extern cvar_t* cf_debug;

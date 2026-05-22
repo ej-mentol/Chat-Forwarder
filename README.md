@@ -90,6 +90,7 @@ All CVars are saved to config (`FCVAR_ARCHIVE`) and take effect immediately at r
 | `cf_enabled` | `1` | Master switch. `0` = plugin idle (no send, no receive). |
 | `cf_server_ip` | `127.0.0.1` | Target IP address for outgoing UDP messages. |
 | `cf_server_port` | `26000` | Target port for outgoing UDP messages. |
+| `cf_allow_ip` | `127.0.0.1` | Allowed source IP for incoming console commands. Use `*` to allow any (insecure). |
 | `cf_listen_port` | `26001` | Local UDP port for incoming console commands. |
 | `cf_listen_only` | `0` | If `1`: only receive commands, do **not** send any messages. Listener always runs; sender is disabled. |
 | `cf_command_delay` | `0` | Minimum seconds between consecutive console command executions. |

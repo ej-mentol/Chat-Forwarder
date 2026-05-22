@@ -12,6 +12,7 @@ mh_enginesave_t* g_pMetaSave = NULL;
 MessageQueue g_messageQueue;
 cvar_t* cf_server_ip = NULL;
 cvar_t* cf_server_port = NULL;
+cvar_t* cf_allow_ip = NULL;
 cvar_t* cf_listen_port = NULL;
 cvar_t* cf_enabled = NULL;
 cvar_t* cf_debug = NULL;
@@ -132,9 +133,9 @@ bool UDPListenerWorkCallback(void* ctx)
         int bytesRead = recvfrom(listenSocket, buffer, sizeof(buffer), 0, (sockaddr*)&fromAddr, &fromLen);
         if (bytesRead > 0)
         {
-            if (IsCvarValid(cf_server_ip) && strcmp(cf_server_ip->string, "*") != 0) {
+            if (IsCvarValid(cf_allow_ip) && strcmp(cf_allow_ip->string, "*") != 0) {
                 sockaddr_in allowedAddr = {};
-                if (inet_pton(AF_INET, cf_server_ip->string, &allowedAddr.sin_addr) != 1 ||
+                if (inet_pton(AF_INET, cf_allow_ip->string, &allowedAddr.sin_addr) != 1 ||
                     fromAddr.sin_addr.s_addr != allowedAddr.sin_addr.s_addr) {
                     continue;
                 }
@@ -304,6 +305,7 @@ void ChatForwarder_Init(void)
         if (gEngfuncs.pfnRegisterVariable) {
             cf_server_ip = gEngfuncs.pfnRegisterVariable("cf_server_ip", "127.0.0.1", FCVAR_ARCHIVE);
             cf_server_port = gEngfuncs.pfnRegisterVariable("cf_server_port", "26000", FCVAR_ARCHIVE);
+            cf_allow_ip = gEngfuncs.pfnRegisterVariable("cf_allow_ip", "127.0.0.1", FCVAR_ARCHIVE);
             cf_listen_port = gEngfuncs.pfnRegisterVariable("cf_listen_port", "26001", FCVAR_ARCHIVE);
             cf_enabled = gEngfuncs.pfnRegisterVariable("cf_enabled", "1", FCVAR_ARCHIVE);
             cf_debug = gEngfuncs.pfnRegisterVariable("cf_debug", "0", FCVAR_ARCHIVE);
@@ -387,6 +389,6 @@ void IPluginsV4::ExitGame(int iResult)
 }
 const char* IPluginsV4::GetVersion(void)
 {
-    return "1.4.5";
+    return "1.4.5.1";
 }
 EXPOSE_SINGLE_INTERFACE(IPluginsV4, IPluginsV4, METAHOOK_PLUGIN_API_VERSION_V4);
