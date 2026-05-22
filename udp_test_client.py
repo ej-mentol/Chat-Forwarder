@@ -10,7 +10,7 @@ import sys
 # ==============================================================================
 # DEFAULTS
 # ==============================================================================
-DEFAULT_SERVER_IP = "192.168.0.15"
+DEFAULT_SERVER_IP = "127.0.0.1"
 DEFAULT_SEND_PORT = 26001
 DEFAULT_LISTEN_PORT = 26000
 DUP_DELTA = 0.2  # 200ms suppression window
