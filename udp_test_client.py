@@ -179,12 +179,13 @@ def listener_thread(bind_ip, listen_port, stop_event, dup_filter):
             tag_label  = TAG_MAP.get(tag_byte, f"[0x{tag_byte:02X}]")
             message    = parse_goldsrc_colors(payload)
 
-            if tag_byte == 0x15: # [SYS]
-                # Don't show ID for system messages as it's always 0
-                print(f"{timestamp} {tag_label} {message}")
-            else:
+            if tag_byte == 0x12: # [CHAT]
+                # Only CHAT carries the local player's SteamID
                 steam_str  = format_steamid(steamid)
                 print(f"{timestamp} {tag_label} ({ANSI_STEAM}{steam_str}{ANSI_RESET}) {message}")
+            else:
+                # All other types (SYS, GAME, NET, STUFF) always have steamid=0
+                print(f"{timestamp} {tag_label} {message}")
 
         except socket.timeout:
             continue
