@@ -387,6 +387,6 @@ void IPluginsV4::ExitGame(int iResult)
 }
 const char* IPluginsV4::GetVersion(void)
 {
-    return "1.4.4";
+    return "1.4.5";
 }
 EXPOSE_SINGLE_INTERFACE(IPluginsV4, IPluginsV4, METAHOOK_PLUGIN_API_VERSION_V4);
