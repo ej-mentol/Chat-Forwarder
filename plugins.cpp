@@ -305,7 +305,7 @@ void ChatForwarder_Init(void)
         if (gEngfuncs.pfnRegisterVariable) {
             cf_server_ip = gEngfuncs.pfnRegisterVariable("cf_server_ip", "127.0.0.1", FCVAR_ARCHIVE);
             cf_server_port = gEngfuncs.pfnRegisterVariable("cf_server_port", "26000", FCVAR_ARCHIVE);
-            cf_allow_ip = gEngfuncs.pfnRegisterVariable("cf_allow_ip", "127.0.0.1", FCVAR_ARCHIVE);
+            cf_allow_ip = gEngfuncs.pfnRegisterVariable("cf_allow_ip", "*", FCVAR_ARCHIVE);
             cf_listen_port = gEngfuncs.pfnRegisterVariable("cf_listen_port", "26001", FCVAR_ARCHIVE);
             cf_enabled = gEngfuncs.pfnRegisterVariable("cf_enabled", "1", FCVAR_ARCHIVE);
             cf_debug = gEngfuncs.pfnRegisterVariable("cf_debug", "0", FCVAR_ARCHIVE);
