@@ -1,11 +1,18 @@
 #ifndef PLUGINS_H
 #define PLUGINS_H
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <metahook.h>
 #include "interface.h"
 #include "HLSDK/common/cvardef.h"
+
+// Steam API - for local player SteamID64
+#include <steam_api.h>
 
 #include <queue>
 #include <string>
@@ -15,28 +22,68 @@
 #include <atomic>
 #include <memory>
 #include <condition_variable>
+#include <cstdint>
 
-constexpr size_t MAX_COMMAND_SIZE = 275;
-constexpr size_t MAX_QUEUE_SIZE = 1000;
+constexpr size_t MAX_QUEUE_SIZE   = 1000;
 constexpr int DEFAULT_LISTEN_PORT = 26001;
 constexpr int DEFAULT_SERVER_PORT = 26000;
-constexpr int SOCKET_TIMEOUT_MS = 500;
-constexpr int THREAD_JOIN_TIMEOUT_MS = 2000;
+constexpr int SOCKET_TIMEOUT_MS   = 500;
 
-// Structs
-struct SenderWorkContext {
-    char message[1024];
-    char server_ip[256];
-    char server_port[16];
-};
+// ---------------------------------------------------------------------------
+// UDP packet layout (all message types, all 5 tags):
+//
+//   [0]     type_byte  : uint8   - message type tag (0x12-0x16)
+//   [1..8]  steamid64  : uint64  - local player SteamID64, little-endian
+//                                  0 = Steam unavailable / not logged in (LAN)
+//   [9..]   message    : char[]  - message text, NOT null-terminated
+//                                  use msglen for exact byte count
+//
+// Parser (Python):
+//   tag     = buf[0]
+//   steamid = struct.unpack_from('<Q', buf, 1)[0]   # 0 = no Steam / LAN
+//   text    = buf[9:].decode('utf-8', errors='replace')
+// ---------------------------------------------------------------------------
 
+// Message type tags
+constexpr uint8_t MSG_TYPE_CHAT  = 0x12;
+constexpr uint8_t MSG_TYPE_GAME  = 0x13;
+constexpr uint8_t MSG_TYPE_NET   = 0x14;
+constexpr uint8_t MSG_TYPE_SYS   = 0x15;
+constexpr uint8_t MSG_TYPE_STUFF = 0x16;
+
+// Fixed header size: 1 (tag) + 8 (steamid64 LE) = 9 bytes
+constexpr size_t CF_HEADER_SIZE = 9;
+// Maximum text payload: keep total UDP packet under 1024 bytes
+constexpr size_t CF_MAX_TEXT    = 1024 - CF_HEADER_SIZE;
+
+// ---------------------------------------------------------------------------
+// SendTask: queued unit of work for the sender thread.
+// The sender thread assembles the binary packet from these fields.
+// ---------------------------------------------------------------------------
 struct SendTask {
-    char message[1024];
-    char server_ip[256];
-    int port;
+    uint8_t  tag;               // message type (MSG_TYPE_CHAT etc.)
+    uint64_t steamid;           // SteamID64 LE; 0 = not available (LAN / no Steam)
+    char     text[CF_MAX_TEXT]; // message text, not null-terminated beyond msglen
+    uint16_t msglen;            // actual byte count in text[]
+    char     server_ip[64];
+    int      port;
 };
 
+// ---------------------------------------------------------------------------
+// Returns the local player's SteamID64.
+// Returns 0 if Steam interface is unavailable or player is not logged on.
+// Only call from the main thread (user message callbacks, HUD_Init, HUD_Frame).
+// ---------------------------------------------------------------------------
+inline uint64_t GetLocalSteamID64() {
+    auto* pSteamUser = SteamUser();
+    if (!pSteamUser || !pSteamUser->BLoggedOn())
+        return 0;
+    return pSteamUser->GetSteamID().ConvertToUint64();
+}
+
+// ---------------------------------------------------------------------------
 // Classes
+// ---------------------------------------------------------------------------
 class SendQueue {
 public:
     bool push(SendTask task) {
@@ -71,6 +118,13 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         shutdown_ = true;
         cv_.notify_all();
+    }
+
+    void reset() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::queue<SendTask> empty;
+        queue_.swap(empty);
+        shutdown_ = false;
     }
 
     void clear() {
@@ -117,6 +171,12 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         shutdown_ = true;
         cv_.notify_all();
+    }
+    void reset() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::queue<std::string> empty;
+        queue_.swap(empty);
+        shutdown_ = false;
     }
     void clear() {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -176,7 +236,9 @@ private:
     bool initialized_;
 };
 
+// ---------------------------------------------------------------------------
 // Externs
+// ---------------------------------------------------------------------------
 extern cl_enginefunc_t gEngfuncs;
 extern cl_exportfuncs_t gExportfuncs;
 extern metahook_api_t* g_pMetaHookAPI;
@@ -191,14 +253,6 @@ extern cvar_t* cf_enabled;
 extern cvar_t* cf_debug;
 extern cvar_t* cf_listen_only;
 extern cvar_t* cf_command_delay;
-// extern cvar_t* cf_capture_mode; // Removed in favor of client-side filtering
-
-// Message Source Tags
-constexpr char MSG_TYPE_CHAT  = '\x12';
-constexpr char MSG_TYPE_GAME  = '\x13';
-constexpr char MSG_TYPE_NET   = '\x14';
-constexpr char MSG_TYPE_SYS   = '\x15';
-constexpr char MSG_TYPE_STUFF = '\x16';
 
 extern std::chrono::steady_clock::time_point g_lastCommandTime;
 extern void (*g_pfnHUD_Init)(void);
@@ -212,12 +266,16 @@ extern std::atomic<bool> g_shutdownListener;
 extern std::atomic<bool> g_shutdownSender;
 
 extern std::unique_ptr<WinsockRAII> g_winsock;
+extern hook_t* g_hOutputDebugStringHook;
+extern bool g_bChatForwarderInitialized;
 extern pfnUserMsgHook g_pfnTextMsg;
 extern void (WINAPI* g_pfnOutputDebugStringA)(LPCSTR lpOutputString);
 extern fn_parsefunc g_pfnCL_ParsePrint;
 extern fn_parsefunc g_pfnCL_ParseStuffText;
 
+// ---------------------------------------------------------------------------
 // Functions
+// ---------------------------------------------------------------------------
 void HUD_Init(void);
 void HUD_Frame(double time);
 void ChatForwarder_Init(void);
@@ -226,6 +284,13 @@ int __MsgFunc_TextMsg(const char* pszName, int iSize, void* pbuf);
 bool UDPListenerWorkCallback(void* ctx);
 bool SenderWorkCallback(void* ctx);
 std::string CleanMessage(const char* input);
+
+// Enqueues a message for UDP delivery.
+// steamid: only pass GetLocalSteamID64() for MSG_TYPE_CHAT (local player chat).
+//          Pass 0 (default) for all other types — server/game/system messages
+//          do not have a meaningful local SteamID.
+// All 5 message types use this single function.
+void QueueTask(uint8_t tag, const std::string& msg, uint64_t steamid = 0);
 
 inline bool IsCvarValid(const cvar_t* cvar) {
     return cvar && cvar->string && cvar->string[0] != '\0';

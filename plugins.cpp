@@ -29,6 +29,8 @@ SendQueue g_sendQueue;
 ThreadWorkItemHandle_t g_hSenderWorkItem = nullptr;
 std::atomic<bool> g_shutdownSender(false);
 pfnUserMsgHook g_pfnTextMsg = NULL;
+hook_t* g_hOutputDebugStringHook = nullptr;
+bool g_bChatForwarderInitialized = false;
 
 void (WINAPI* g_pfnOutputDebugStringA)(LPCSTR lpOutputString) = NULL;
 
@@ -39,7 +41,11 @@ void WINAPI NewOutputDebugStringA(LPCSTR lpOutputString) {
         return;
     }
 
-    g_inHook = true;
+    struct ReentryGuard {
+        bool& flag;
+        explicit ReentryGuard(bool& value) : flag(value) { flag = true; }
+        ~ReentryGuard() { flag = false; }
+    } guard(g_inHook);
 
     if (IsCvarValid(cf_enabled) && atoi(cf_enabled->string) != 0) {
         static std::string g_sysLogBuffer;
@@ -55,43 +61,26 @@ void WINAPI NewOutputDebugStringA(LPCSTR lpOutputString) {
             if (!line.empty() && line.back() == '\r') {
                 line.pop_back();
             }
-            
+
             g_sysLogBuffer.erase(0, pos + 1);
 
             std::string cleanMsg = CleanMessage(line.c_str());
             if (!cleanMsg.empty()) {
-                std::string fullMsg;
-                fullMsg += MSG_TYPE_SYS;
-                fullMsg += cleanMsg;
-
-                SendTask task;
-                strncpy_s(task.message, fullMsg.c_str(), sizeof(task.message) - 1);
-                strncpy_s(task.server_ip, cf_server_ip->string, sizeof(task.server_ip) - 1);
-                task.port = atoi(cf_server_port->string);
-                g_sendQueue.push(task);
+                QueueTask(MSG_TYPE_SYS, cleanMsg);
             }
         }
 
         // Safety valve: if buffer grows too large without newline, flush it
         if (g_sysLogBuffer.size() > 4096) {
-             std::string cleanMsg = CleanMessage(g_sysLogBuffer.c_str());
-             if (!cleanMsg.empty()) {
-                std::string fullMsg;
-                fullMsg += MSG_TYPE_SYS;
-                fullMsg += cleanMsg;
-
-                SendTask task;
-                strncpy_s(task.message, fullMsg.c_str(), sizeof(task.message) - 1);
-                strncpy_s(task.server_ip, cf_server_ip->string, sizeof(task.server_ip) - 1);
-                task.port = atoi(cf_server_port->string);
-                g_sendQueue.push(task);
-             }
-             g_sysLogBuffer.clear();
+            std::string cleanMsg = CleanMessage(g_sysLogBuffer.c_str());
+            if (!cleanMsg.empty()) {
+                QueueTask(MSG_TYPE_SYS, cleanMsg);
+            }
+            g_sysLogBuffer.clear();
         }
     }
 
     if (g_pfnOutputDebugStringA) g_pfnOutputDebugStringA(lpOutputString);
-    g_inHook = false;
 }
 
 bool UDPListenerWorkCallback(void* ctx)
@@ -138,9 +127,19 @@ bool UDPListenerWorkCallback(void* ctx)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
-        int bytesRead = recvfrom(listenSocket, buffer, sizeof(buffer), 0, NULL, NULL);
+        sockaddr_in fromAddr = {};
+        int fromLen = sizeof(fromAddr);
+        int bytesRead = recvfrom(listenSocket, buffer, sizeof(buffer), 0, (sockaddr*)&fromAddr, &fromLen);
         if (bytesRead > 0)
         {
+            if (IsCvarValid(cf_server_ip) && strcmp(cf_server_ip->string, "*") != 0) {
+                sockaddr_in allowedAddr = {};
+                if (inet_pton(AF_INET, cf_server_ip->string, &allowedAddr.sin_addr) != 1 ||
+                    fromAddr.sin_addr.s_addr != allowedAddr.sin_addr.s_addr) {
+                    continue;
+                }
+            }
+
             std::string msg(buffer, bytesRead);
 
             // Trim all trailing control characters and spaces
@@ -183,8 +182,14 @@ bool SenderWorkCallback(void* ctx) {
         }
     } socketGuard(sock);
 
+    // Static packet buffer: tag(1) + steamid64_LE(8) + text(up to CF_MAX_TEXT)
+    // Max size = CF_HEADER_SIZE + CF_MAX_TEXT = 1024 bytes
+    char pktbuf[CF_HEADER_SIZE + CF_MAX_TEXT];
+
     while (!g_shutdownSender.load(std::memory_order_relaxed)) {
-        if (!IsCvarValid(cf_enabled) || atoi(cf_enabled->string) == 0) {
+        // Pause if plugin is disabled OR if listen-only mode is active
+        if (!IsCvarValid(cf_enabled) || atoi(cf_enabled->string) == 0 ||
+            (IsCvarValid(cf_listen_only) && atoi(cf_listen_only->string) != 0)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
@@ -197,11 +202,28 @@ bool SenderWorkCallback(void* ctx) {
                 sockaddr_in addr = {};
                 addr.sin_family = AF_INET;
                 addr.sin_port = htons(task.port);
-                inet_pton(AF_INET, task.server_ip, &addr.sin_addr);
+                // If the IP is invalid (e.g. cvar not yet set), skip this task
+                if (inet_pton(AF_INET, task.server_ip, &addr.sin_addr) != 1) {
+                    continue;
+                }
 
-                sendto(sock, task.message, strlen(task.message), 0,
+                // Assemble binary packet:
+                //   [0]     tag       (1 byte,  message type 0x12-0x16)
+                //   [1..8]  steamid64 (8 bytes, little-endian uint64)
+                //           0 = Steam unavailable / LAN game
+                //   [9..]   text      (task.msglen bytes, not null-terminated)
+                const size_t pktlen = CF_HEADER_SIZE + task.msglen;
+                pktbuf[0] = static_cast<char>(task.tag);
+                // Write steamid64 LE (portable, no UB via type-punning)
+                uint64_t sid = task.steamid;
+                for (int i = 0; i < 8; ++i) {
+                    pktbuf[1 + i] = static_cast<char>(sid & 0xFFu);
+                    sid >>= 8;
+                }
+                memcpy(pktbuf + CF_HEADER_SIZE, task.text, task.msglen);
+
+                sendto(sock, pktbuf, static_cast<int>(pktlen), 0,
                     (const sockaddr*)&addr, sizeof(addr));
-            
             } while (g_sendQueue.pop(task, 0)); // Pop instantly until empty
         }
     }
@@ -211,25 +233,48 @@ bool SenderWorkCallback(void* ctx) {
 
 void CleanupResources()
 {
+    // 1. Signal all worker threads to stop
     g_shutdownListener.store(true, std::memory_order_release);
     g_shutdownSender.store(true, std::memory_order_release);
 
+    // 2. Wake up threads blocked on condition_variable so they exit immediately
+    //    instead of waiting for the next pop/push timeout
+    g_sendQueue.shutdown();
+    g_messageQueue.shutdown();
+
+    // 3. Wait for listener thread to finish, then release its MetaHook work item
     if (g_hListenerWorkItem) {
+        if (g_pMetaHookAPI && g_hThreadPool) {
+            g_pMetaHookAPI->WaitForWorkItemToComplete(g_hListenerWorkItem);
+            g_pMetaHookAPI->DeleteWorkItem(g_hListenerWorkItem);
+        }
         g_hListenerWorkItem = nullptr;
     }
 
+    // 4. Wait for sender thread to finish, then release its MetaHook work item
     if (g_hSenderWorkItem) {
+        if (g_pMetaHookAPI && g_hThreadPool) {
+            g_pMetaHookAPI->WaitForWorkItemToComplete(g_hSenderWorkItem);
+            g_pMetaHookAPI->DeleteWorkItem(g_hSenderWorkItem);
+        }
         g_hSenderWorkItem = nullptr;
     }
 
-    g_messageQueue.clear();
-    g_sendQueue.clear();
+    // 5. Remove the IAT hook before the plugin can be unloaded.
+    if (g_hOutputDebugStringHook && g_pMetaHookAPI) {
+        g_pMetaHookAPI->UnHook(g_hOutputDebugStringHook);
+        g_hOutputDebugStringHook = nullptr;
+        g_pfnOutputDebugStringA = nullptr;
+    }
+
+    // 6. Release Winsock and allow clean reinitialization on the next HUD_Init.
     g_winsock.reset();
+    g_sendQueue.reset();
+    g_messageQueue.reset();
+    g_bChatForwarderInitialized = false;
 }
 void ChatForwarder_Init(void)
 {
-    static bool bInitialized = false;
-
     // Engine type check as suggested
     auto engineType = g_pMetaHookAPI->GetEngineType();
     if (engineType == ENGINE_GOLDSRC_BLOB) {
@@ -241,7 +286,7 @@ void ChatForwarder_Init(void)
     }
 
     // Initialize global resources once
-    if (!bInitialized)
+    if (!g_bChatForwarderInitialized)
     {
         // Optional: Check for debugger
         if (g_pMetaHookAPI->IsDebuggerPresent()) {
@@ -268,9 +313,9 @@ void ChatForwarder_Init(void)
 
         // Hook OutputDebugStringA in engine to capture everything DebugView sees
         // Only hook once!
-        g_pMetaHookAPI->IATHook(g_pMetaHookAPI->GetEngineModule(), "kernel32.dll", "OutputDebugStringA", NewOutputDebugStringA, (void**)&g_pfnOutputDebugStringA);
+        g_hOutputDebugStringHook = g_pMetaHookAPI->IATHook(g_pMetaHookAPI->GetEngineModule(), "kernel32.dll", "OutputDebugStringA", NewOutputDebugStringA, (void**)&g_pfnOutputDebugStringA);
 
-        bInitialized = true;
+        g_bChatForwarderInitialized = true;
     }
 
     // Ensure thread pool is valid
@@ -282,8 +327,10 @@ void ChatForwarder_Init(void)
         return;
     }
 
-    // Restart Sender Thread if not running
-    if (!g_hSenderWorkItem) {
+    // Start Sender thread only if NOT in listen-only mode.
+    // cf_listen_only=1 means: accept inbound commands, but send nothing outbound.
+    // Runtime blocking is also handled inside SenderWorkCallback.
+    if (!g_hSenderWorkItem && (!IsCvarValid(cf_listen_only) || atoi(cf_listen_only->string) == 0)) {
         g_shutdownSender.store(false, std::memory_order_relaxed);
         g_hSenderWorkItem = g_pMetaHookAPI->CreateWorkItem(g_hThreadPool, SenderWorkCallback, nullptr);
 
@@ -296,9 +343,9 @@ void ChatForwarder_Init(void)
         g_pMetaHookAPI->QueueWorkItem(g_hThreadPool, g_hSenderWorkItem);
     }
 
-    // Restart Listener Thread if not running (and allowed)
-    if ((!IsCvarValid(cf_listen_only) || atoi(cf_listen_only->string) == 0) && !g_hListenerWorkItem)
-    {
+    // Always start the Listener thread — it handles inbound console commands
+    // regardless of cf_listen_only mode.
+    if (!g_hListenerWorkItem) {
         g_shutdownListener.store(false, std::memory_order_relaxed);
         g_hListenerWorkItem = g_pMetaHookAPI->CreateWorkItem(g_hThreadPool, UDPListenerWorkCallback, nullptr);
 
@@ -340,6 +387,6 @@ void IPluginsV4::ExitGame(int iResult)
 }
 const char* IPluginsV4::GetVersion(void)
 {
-    return "1.4.3";
+    return "1.4.4";
 }
 EXPOSE_SINGLE_INTERFACE(IPluginsV4, IPluginsV4, METAHOOK_PLUGIN_API_VERSION_V4);
