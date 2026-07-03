@@ -66,7 +66,7 @@ def parse_goldsrc_colors(data_bytes):
             res_bytes.extend(b"\n")
         elif byte == 0x0D:  # CR - skip
             pass
-        elif byte >= 0x20 or byte > 0x7F:  # Printable or UTF-8 continuation
+        elif byte >= 0x20:
             res_bytes.append(byte)
     try:
         return res_bytes.decode('utf-8', errors='replace') + ANSI_RESET
@@ -99,21 +99,24 @@ class DuplicateFilter:
     def __init__(self, enabled=True, delta=0.2):
         self.enabled = enabled
         self.delta = delta
-        self.history = {} # cleaned_payload -> last_seen_time
+        self.history = {}
+        self._calls = 0
 
-    def is_duplicate(self, payload):
+    def is_duplicate(self, tag_byte, payload):
         if not self.enabled:
             return False
-        
+
         now = time.time()
-        clean = strip_goldsrc_colors(payload)
-        
-        # Prune old entries
-        self.history = {c: t for c, t in self.history.items() if now - t < self.delta}
-        
-        if clean in self.history:
+        clean = (tag_byte, strip_goldsrc_colors(payload))
+
+        self._calls += 1
+        if self._calls % 50 == 0:
+            self.history = {c: t for c, t in self.history.items() if now - t < self.delta}
+
+        last = self.history.get(clean)
+        if last is not None and now - last < self.delta:
             return True
-        
+
         self.history[clean] = now
         return False
 
@@ -172,7 +175,7 @@ def listener_thread(bind_ip, listen_port, stop_event, dup_filter):
             steamid  = struct.unpack_from('<Q', data, 1)[0]
             payload  = data[CF_HEADER_SIZE:]
 
-            if dup_filter.is_duplicate(payload):
+            if dup_filter.is_duplicate(tag_byte, payload):
                 continue
 
             timestamp  = f"{ANSI_GREY}[{datetime.datetime.now().strftime('%H:%M:%S')}]{ANSI_RESET}"

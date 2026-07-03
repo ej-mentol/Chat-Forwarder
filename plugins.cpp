@@ -10,6 +10,7 @@ mh_interface_t* g_pInterface = NULL;
 mh_enginesave_t* g_pMetaSave = NULL;
 
 MessageQueue g_messageQueue;
+NetConfig g_netConfig;
 cvar_t* cf_server_ip = NULL;
 cvar_t* cf_server_port = NULL;
 cvar_t* cf_allow_ip = NULL;
@@ -48,7 +49,7 @@ void WINAPI NewOutputDebugStringA(LPCSTR lpOutputString) {
         ~ReentryGuard() { flag = false; }
     } guard(g_inHook);
 
-    if (IsCvarValid(cf_enabled) && atoi(cf_enabled->string) != 0) {
+    if (g_netConfig.enabled.load(std::memory_order_relaxed)) {
         static std::string g_sysLogBuffer;
         static std::mutex g_logMutex;
 
@@ -247,7 +248,7 @@ void CleanupResources()
     if (g_hListenerWorkItem) {
         if (g_pMetaHookAPI && g_hThreadPool) {
             g_pMetaHookAPI->WaitForWorkItemToComplete(g_hListenerWorkItem);
-            g_pMetaHookAPI->DeleteWorkItem(g_hListenerWorkItem);
+            // g_pMetaHookAPI->DeleteWorkItem(g_hListenerWorkItem);
         }
         g_hListenerWorkItem = nullptr;
     }
@@ -256,7 +257,7 @@ void CleanupResources()
     if (g_hSenderWorkItem) {
         if (g_pMetaHookAPI && g_hThreadPool) {
             g_pMetaHookAPI->WaitForWorkItemToComplete(g_hSenderWorkItem);
-            g_pMetaHookAPI->DeleteWorkItem(g_hSenderWorkItem);
+            // g_pMetaHookAPI->DeleteWorkItem(g_hSenderWorkItem);
         }
         g_hSenderWorkItem = nullptr;
     }
@@ -389,6 +390,6 @@ void IPluginsV4::ExitGame(int iResult)
 }
 const char* IPluginsV4::GetVersion(void)
 {
-    return "1.4.5.1";
+    return "1.4.5.2";
 }
 EXPOSE_SINGLE_INTERFACE(IPluginsV4, IPluginsV4, METAHOOK_PLUGIN_API_VERSION_V4);

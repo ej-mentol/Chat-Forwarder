@@ -38,8 +38,6 @@ fn_parsefunc g_pfnCL_ParseStuffText = NULL;
 // ---------------------------------------------------------------------------
 void QueueTask(uint8_t tag, const std::string& msg, uint64_t steamid) {
     if (msg.empty()) return;
-    // Cvars may not be registered yet (e.g., called before HUD_Init completes)
-    if (!IsCvarValid(cf_server_ip) || !IsCvarValid(cf_server_port)) return;
 
     const size_t copyLen = (msg.size() < CF_MAX_TEXT) ? msg.size() : CF_MAX_TEXT - 1;
 
@@ -48,8 +46,13 @@ void QueueTask(uint8_t tag, const std::string& msg, uint64_t steamid) {
     task.steamid = steamid; // 0 = no Steam / LAN / not applicable
     memcpy(task.text, msg.c_str(), copyLen);
     task.msglen  = static_cast<uint16_t>(copyLen);
-    strncpy_s(task.server_ip, cf_server_ip->string, sizeof(task.server_ip) - 1);
-    task.port = atoi(cf_server_port->string);
+
+    {
+        std::lock_guard<std::mutex> lock(g_netConfig.mtx);
+        if (!g_netConfig.valid) return; // cvars not registered yet
+        strncpy_s(task.server_ip, g_netConfig.server_ip, sizeof(task.server_ip) - 1);
+        task.port = g_netConfig.port;
+    }
 
     g_sendQueue.push(task);
 }
@@ -103,6 +106,14 @@ void HUD_Init(void) {
 }
 
 void HUD_Frame(double time) {
+    g_netConfig.enabled.store(IsCvarValid(cf_enabled) && atoi(cf_enabled->string) != 0, std::memory_order_relaxed);
+    if (IsCvarValid(cf_server_ip) && IsCvarValid(cf_server_port)) {
+        std::lock_guard<std::mutex> lock(g_netConfig.mtx);
+        strncpy_s(g_netConfig.server_ip, cf_server_ip->string, sizeof(g_netConfig.server_ip) - 1);
+        g_netConfig.port = atoi(cf_server_port->string);
+        g_netConfig.valid = true;
+    }
+
     auto now = std::chrono::steady_clock::now();
     double delay = IsCvarValid(cf_command_delay) ? (double)cf_command_delay->value : 0.0;
     double elapsed = std::chrono::duration<double>(now - g_lastCommandTime).count();

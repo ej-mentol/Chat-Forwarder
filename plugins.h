@@ -56,6 +56,18 @@ constexpr size_t CF_HEADER_SIZE = 9;
 // Maximum text payload: keep total UDP packet under 1024 bytes
 constexpr size_t CF_MAX_TEXT    = 1024 - CF_HEADER_SIZE;
 
+// Snapshot of enabled/ip/port, refreshed once per frame on main thread.
+// NewOutputDebugStringA/QueueTask can run off main thread and must never
+// dereference cvar_t::string directly (engine may realloc it concurrently).
+struct NetConfig {
+    std::atomic<bool> enabled{false};
+    std::mutex mtx;
+    char server_ip[64]{};
+    int port{0};
+    bool valid{false};
+};
+extern NetConfig g_netConfig;
+
 // ---------------------------------------------------------------------------
 // SendTask: queued unit of work for the sender thread.
 // The sender thread assembles the binary packet from these fields.
