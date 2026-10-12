@@ -1,7 +1,9 @@
 // plugins.cpp
 #include "plugins.h"
+#include "netdiag.h"
 #include "Interface/IPlugins.h"
 #include <chrono>
+#include <cctype>
 #pragma comment(lib, "ws2_32.lib")
 cl_enginefunc_t gEngfuncs;
 cl_exportfuncs_t gExportfuncs;
@@ -23,6 +25,8 @@ cvar_t* cf_command_delay = NULL;
 std::chrono::steady_clock::time_point g_lastCommandTime;
 void (*g_pfnHUD_Init)(void) = NULL;
 void (*g_pfnHUD_Frame)(double time) = NULL;
+int (*g_pfnHUD_GetStudioModelInterface)(int version, struct r_studio_interface_s **ppinterface, struct engine_studio_api_s *pstudio) = NULL;
+engine_studio_api_t g_engineStudio = { 0 };
 ThreadPoolHandle_t g_hThreadPool = nullptr;
 ThreadWorkItemHandle_t g_hListenerWorkItem = nullptr;
 std::atomic<bool> g_shutdownListener(false);
@@ -87,136 +91,167 @@ void WINAPI NewOutputDebugStringA(LPCSTR lpOutputString) {
 
 bool UDPListenerWorkCallback(void* ctx)
 {
-    SOCKET listenSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (listenSocket == INVALID_SOCKET) {
-        return true;
-    }
-    struct SocketGuard {
-        SOCKET sock;
-        SocketGuard(SOCKET s) : sock(s) {}
-        ~SocketGuard() {
-            if (sock != INVALID_SOCKET) {
-                closesocket(sock);
-            }
-        }
-    } socketGuard(listenSocket);
-    sockaddr_in serverAddr = {};
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = INADDR_ANY;
-    int listenPort = DEFAULT_LISTEN_PORT;
-    if (IsCvarValid(cf_listen_port)) {
-        int port = atoi(cf_listen_port->string);
-        if (port > 0 && port <= 65535) {
-            listenPort = port;
-        }
-    }
-    serverAddr.sin_port = htons(listenPort);
-    {
-        BOOL yes = TRUE;
-        setsockopt(listenSocket, SOL_SOCKET, SO_REUSEADDR,
-                   reinterpret_cast<const char*>(&yes), sizeof(yes));
-    }
-    if (bind(listenSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
-        return true;
-    }
-    int timeout_ms = SOCKET_TIMEOUT_MS;
-    setsockopt(listenSocket, SOL_SOCKET, SO_RCVTIMEO,
-               reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
-    char buffer[256];
+    NetDiag& d = Diag();
+    SOCKET sock = INVALID_SOCKET;
+    uint32_t gen = 0;
+    std::string lastDeniedIp;
+    char buffer[512];
+
     while (!g_shutdownListener.load(std::memory_order_relaxed))
     {
-        if (IsCvarValid(cf_enabled) && atoi(cf_enabled->string) == 0) {
+        if (!g_netConfig.enabled.load(std::memory_order_relaxed)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
-        sockaddr_in fromAddr = {};
-        int fromLen = sizeof(fromAddr);
-        int bytesRead = recvfrom(listenSocket, buffer, sizeof(buffer), 0, (sockaddr*)&fromAddr, &fromLen);
-        if (bytesRead > 0)
-        {
-            if (IsCvarValid(cf_allow_ip) && strcmp(cf_allow_ip->string, "*") != 0) {
-                sockaddr_in allowedAddr = {};
-                if (inet_pton(AF_INET, cf_allow_ip->string, &allowedAddr.sin_addr) != 1 ||
-                    fromAddr.sin_addr.s_addr != allowedAddr.sin_addr.s_addr) {
-                    continue;
+
+        NetCfg cfg;
+        uint32_t g = CfgGet(cfg);
+        if (g == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+
+        if (sock == INVALID_SOCKET || g != gen) {
+            if (sock != INVALID_SOCKET) closesocket(sock);
+            std::string info;
+            sock = OpenUdp(cfg.bindIp, cfg.listenPort, true, SOCKET_TIMEOUT_MS, info);
+            SetState(&NetDiag::listenState, "listener", info, sock != INVALID_SOCKET);
+            gen = g;
+            if (sock == INVALID_SOCKET) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                continue;
+            }
+        }
+
+        sockaddr_in from = {};
+        int fromLen = sizeof(from);
+        int n = recvfrom(sock, buffer, sizeof(buffer), 0, (sockaddr*)&from, &fromLen);
+        if (n == SOCKET_ERROR) {
+            int e = WSAGetLastError();
+            if (e == WSAETIMEDOUT || e == WSAEWOULDBLOCK) continue;
+            if (e == WSAECONNRESET || e == WSAEMSGSIZE) {
+                DiagLog(1, "listener: recv WSA %d ignored", e);
+                continue;
+            }
+            closesocket(sock);
+            sock = INVALID_SOCKET;
+            SetState(&NetDiag::listenState, "listener", WsaErr("recvfrom", e) + ", rebinding", false);
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            continue;
+        }
+        if (n <= 0) continue;
+
+        ++d.rx;
+        d.lastRxMs = NowMs();
+        const std::string fromStr = AddrStr(from);
+
+        if (!cfg.allowIp.empty() && cfg.allowIp != "*") {
+            in_addr allowed;
+            if (!ParseIp(cfg.allowIp, allowed) || from.sin_addr.s_addr != allowed.s_addr) {
+                ++d.rxDenied;
+                std::string ip = fromStr.substr(0, fromStr.rfind(':'));
+                if (ip != lastDeniedIp) {
+                    lastDeniedIp = ip;
+                    DiagLog(0, "listener: DROPPED packet from %s (cf_allow_ip=%s)", ip.c_str(), cfg.allowIp.c_str());
                 }
-            }
-
-            std::string msg(buffer, bytesRead);
-
-            // Trim all trailing control characters and spaces
-            while (!msg.empty() && (unsigned char)msg.back() <= 32) {
-                msg.pop_back();
-            }
-            // Trim leading spaces
-            size_t first = msg.find_first_not_of(" \t\n\r");
-            if (first != std::string::npos && first > 0) {
-                msg = msg.substr(first);
-            }
-
-            if (!msg.empty()) {
-                g_messageQueue.push(std::move(msg));
+                continue;
             }
         }
-        else if (bytesRead == SOCKET_ERROR) {
-            int error = WSAGetLastError();
-            if (error != WSAETIMEDOUT && error != WSAEWOULDBLOCK) {
-                break;
+
+        {
+            std::lock_guard<std::mutex> lk(d.mtx);
+            d.lastRxFrom = fromStr;
+        }
+
+        // Pong packet check: 0x1F ('\x1F') followed by PONG
+        if ((unsigned char)buffer[0] == CF_PONG_MARK) {
+            std::string pongMsg(buffer, n);
+            NetDiag_HandlePong(pongMsg);
+            continue;
+        }
+
+        std::string msg(buffer, n);
+        // Trim trailing whitespace and control characters
+        while (!msg.empty() && (unsigned char)msg.back() <= 32) {
+            msg.pop_back();
+        }
+        // Trim leading whitespace
+        size_t first = msg.find_first_not_of(" \t\n\r");
+        if (first != std::string::npos && first > 0) {
+            msg = msg.substr(first);
+        }
+        if (msg.empty()) continue;
+
+        {
+            std::lock_guard<std::mutex> lk(d.mtx);
+            d.lastRxHead = (msg.size() > 32) ? msg.substr(0, 32) : msg;
+        }
+
+        if (cfg.sayOnly) {
+            auto startsWithIgnoreCase = [](const std::string& str, const char* prefix, size_t prefixLen) {
+                if (str.size() < prefixLen) return false;
+                for (size_t i = 0; i < prefixLen; ++i) {
+                    if (tolower((unsigned char)str[i]) != tolower((unsigned char)prefix[i]))
+                        return false;
+                }
+                return true;
+            };
+
+            bool say = startsWithIgnoreCase(msg, "say ", 4) || startsWithIgnoreCase(msg, "say_team ", 9);
+            if (!say || msg.find_first_of(";\n\r\0", 0, 4) != std::string::npos) {
+                ++d.rxFiltered;
+                continue;
             }
         }
+
+        ++d.rxCmd;
+        g_messageQueue.push(std::move(msg));
     }
+
+    if (sock != INVALID_SOCKET) closesocket(sock);
     return true;
 }
 
 bool SenderWorkCallback(void* ctx) {
-    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock == INVALID_SOCKET) {
-        return true;
-    }
-
-    struct SocketGuard {
-        SOCKET sock;
-        SocketGuard(SOCKET s) : sock(s) {}
-        ~SocketGuard() {
-            if (sock != INVALID_SOCKET) {
-                closesocket(sock);
-            }
-        }
-    } socketGuard(sock);
-
-    // Static packet buffer: tag(1) + steamid64_LE(8) + text(up to CF_MAX_TEXT)
-    // Max size = CF_HEADER_SIZE + CF_MAX_TEXT = 1024 bytes
+    NetDiag& d = Diag();
+    SOCKET sock = INVALID_SOCKET;
+    uint32_t gen = 0;
+    bool failing = false;
+    std::string okInfo;
     char pktbuf[CF_HEADER_SIZE + CF_MAX_TEXT];
 
     while (!g_shutdownSender.load(std::memory_order_relaxed)) {
-        // Pause if plugin is disabled OR if listen-only mode is active
-        if (!IsCvarValid(cf_enabled) || atoi(cf_enabled->string) == 0 ||
-            (IsCvarValid(cf_listen_only) && atoi(cf_listen_only->string) != 0)) {
+        NetCfg cfg;
+        uint32_t g = CfgGet(cfg);
+        if (g == 0 || !g_netConfig.enabled.load(std::memory_order_relaxed) || cfg.listenOnly) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
 
+        if (sock == INVALID_SOCKET || g != gen) {
+            if (sock != INVALID_SOCKET) closesocket(sock);
+            sock = OpenUdp(cfg.bindIp, 0, false, 0, okInfo);
+            SetState(&NetDiag::senderState, "sender", okInfo, sock != INVALID_SOCKET);
+            gen = g;
+            failing = false;
+            if (sock == INVALID_SOCKET) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                continue;
+            }
+        }
+
         SendTask task;
-        // Batch processing: Drain the queue as fast as possible
-        // Wait 1ms for the first item, then process remaining items instantly
         if (g_sendQueue.pop(task, 1)) {
             do {
                 sockaddr_in addr = {};
                 addr.sin_family = AF_INET;
-                addr.sin_port = htons(task.port);
-                // If the IP is invalid (e.g. cvar not yet set), skip this task
+                addr.sin_port = htons(static_cast<u_short>(task.port));
                 if (inet_pton(AF_INET, task.server_ip, &addr.sin_addr) != 1) {
                     continue;
                 }
 
-                // Assemble binary packet:
-                //   [0]     tag       (1 byte,  message type 0x12-0x16)
-                //   [1..8]  steamid64 (8 bytes, little-endian uint64)
-                //           0 = Steam unavailable / LAN game
-                //   [9..]   text      (task.msglen bytes, not null-terminated)
                 const size_t pktlen = CF_HEADER_SIZE + task.msglen;
                 pktbuf[0] = static_cast<char>(task.tag);
-                // Write steamid64 LE (portable, no UB via type-punning)
                 uint64_t sid = task.steamid;
                 for (int i = 0; i < 8; ++i) {
                     pktbuf[1 + i] = static_cast<char>(sid & 0xFFu);
@@ -224,12 +259,28 @@ bool SenderWorkCallback(void* ctx) {
                 }
                 memcpy(pktbuf + CF_HEADER_SIZE, task.text, task.msglen);
 
-                sendto(sock, pktbuf, static_cast<int>(pktlen), 0,
+                int rc = sendto(sock, pktbuf, static_cast<int>(pktlen), 0,
                     (const sockaddr*)&addr, sizeof(addr));
-            } while (g_sendQueue.pop(task, 0)); // Pop instantly until empty
+                if (rc == SOCKET_ERROR) {
+                    int e = WSAGetLastError();
+                    ++d.txErr;
+                    d.lastTxErr = e;
+                    failing = true;
+                    SetState(&NetDiag::senderState, "sender",
+                        WsaErr((std::string("sendto ") + task.server_ip).c_str(), e), false);
+                } else {
+                    ++d.tx;
+                    d.lastTxMs = NowMs();
+                    if (failing) {
+                        failing = false;
+                        SetState(&NetDiag::senderState, "sender", okInfo, true);
+                    }
+                }
+            } while (g_sendQueue.pop(task, 0));
         }
     }
 
+    if (sock != INVALID_SOCKET) closesocket(sock);
     return true;
 }
 
@@ -277,6 +328,8 @@ void CleanupResources()
 }
 void ChatForwarder_Init(void)
 {
+    if (!g_pMetaHookAPI) return;
+
     // Engine type check as suggested
     auto engineType = g_pMetaHookAPI->GetEngineType();
     if (engineType == ENGINE_GOLDSRC_BLOB) {
@@ -292,14 +345,12 @@ void ChatForwarder_Init(void)
     {
         // Optional: Check for debugger
         if (g_pMetaHookAPI->IsDebuggerPresent()) {
-            gEngfuncs.Con_Printf("ChatForwarder: Debugger detected.\n");
+            gEngfuncs.Con_Printf("[CF] Debugger detected.\n");
         }
 
-        g_winsock = std::unique_ptr<WinsockRAII>(new WinsockRAII());
+        g_winsock = std::make_unique<WinsockRAII>();
         if (!g_winsock->IsInitialized()) {
-            if (g_pMetaHookAPI) {
-                g_pMetaHookAPI->SysError("Failed to initialize Winsock");
-            }
+            g_pMetaHookAPI->SysError("Failed to initialize Winsock");
             return;
         }
 
@@ -314,6 +365,8 @@ void ChatForwarder_Init(void)
             cf_command_delay = gEngfuncs.pfnRegisterVariable("cf_command_delay", "0", FCVAR_ARCHIVE);
         }
 
+        NetDiag_Init();
+
         // Hook OutputDebugStringA in engine to capture everything DebugView sees
         // Only hook once!
         g_hOutputDebugStringHook = g_pMetaHookAPI->IATHook(g_pMetaHookAPI->GetEngineModule(), "kernel32.dll", "OutputDebugStringA", NewOutputDebugStringA, (void**)&g_pfnOutputDebugStringA);
@@ -324,23 +377,18 @@ void ChatForwarder_Init(void)
     // Ensure thread pool is valid
     g_hThreadPool = g_pMetaHookAPI->GetGlobalThreadPool();
     if (!g_hThreadPool) {
-        if (g_pMetaHookAPI) {
-            g_pMetaHookAPI->SysError("Failed to get MetaHook thread pool");
-        }
+        g_pMetaHookAPI->SysError("Failed to get MetaHook thread pool");
         return;
     }
 
-    // Start Sender thread only if NOT in listen-only mode.
-    // cf_listen_only=1 means: accept inbound commands, but send nothing outbound.
-    // Runtime blocking is also handled inside SenderWorkCallback.
-    if (!g_hSenderWorkItem && (!IsCvarValid(cf_listen_only) || atoi(cf_listen_only->string) == 0)) {
+    // Always start Sender thread.
+    // Dynamic gating for cf_listen_only and cf_enabled is handled inside SenderWorkCallback.
+    if (!g_hSenderWorkItem) {
         g_shutdownSender.store(false, std::memory_order_relaxed);
         g_hSenderWorkItem = g_pMetaHookAPI->CreateWorkItem(g_hThreadPool, SenderWorkCallback, nullptr);
 
         if (!g_hSenderWorkItem) {
-            if (g_pMetaHookAPI) {
-                g_pMetaHookAPI->SysError("Failed to create sender work item");
-            }
+            g_pMetaHookAPI->SysError("Failed to create sender work item");
             return;
         }
         g_pMetaHookAPI->QueueWorkItem(g_hThreadPool, g_hSenderWorkItem);
@@ -353,9 +401,7 @@ void ChatForwarder_Init(void)
         g_hListenerWorkItem = g_pMetaHookAPI->CreateWorkItem(g_hThreadPool, UDPListenerWorkCallback, nullptr);
 
         if (!g_hListenerWorkItem) {
-            if (g_pMetaHookAPI) {
-                g_pMetaHookAPI->SysError("Failed to create listener work item");
-            }
+            g_pMetaHookAPI->SysError("Failed to create listener work item");
             return;
         }
         g_pMetaHookAPI->QueueWorkItem(g_hThreadPool, g_hListenerWorkItem);
@@ -383,6 +429,10 @@ void IPluginsV4::LoadClient(cl_exportfuncs_t* pExportFunc)
     pExportFunc->HUD_Init = HUD_Init;
     g_pfnHUD_Frame = pExportFunc->HUD_Frame;
     pExportFunc->HUD_Frame = HUD_Frame;
+    g_pfnHUD_GetStudioModelInterface = pExportFunc->HUD_GetStudioModelInterface;
+    if (g_pfnHUD_GetStudioModelInterface) {
+        pExportFunc->HUD_GetStudioModelInterface = HUD_GetStudioModelInterface;
+    }
 }
 void IPluginsV4::ExitGame(int iResult)
 {
@@ -390,6 +440,6 @@ void IPluginsV4::ExitGame(int iResult)
 }
 const char* IPluginsV4::GetVersion(void)
 {
-    return "1.4.5.2";
+    return "1.5.0.0";
 }
 EXPOSE_SINGLE_INTERFACE(IPluginsV4, IPluginsV4, METAHOOK_PLUGIN_API_VERSION_V4);
