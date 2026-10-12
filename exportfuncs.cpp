@@ -2,6 +2,7 @@
 #define _WIN32_WINNT 0x0600
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 #include "plugins.h"
+#include "netdiag.h"
 #include "HLSDK/common/parsemsg.h"
 #include <string>
 #include <cstring>
@@ -19,7 +20,7 @@ std::string CleanMessage(const char* input) {
     while (*input) {
         unsigned char c = (unsigned char)*input;
         // Allow printable characters, color codes (1-4), \r, \n, \t. Skip bell (7).
-        if (c >= 0x20 || (c >= 0x01 && c <= 0x04) || c == '\r' || c == '\n' || c == '\t') {
+        if (c >= 0x20 || c <= 0x04 || c == '\r' || c == '\n' || c == '\t') {
             out += *input;
         }
         input++;
@@ -63,7 +64,7 @@ void __MsgFunc_Print(void) {
         std::string cleanMsg = CleanMessage(psz);
         if (!cleanMsg.empty()) {
             if (IsCvarValid(cf_debug) && atoi(cf_debug->string) > 0) {
-                gEngfuncs.Con_Printf("[ChatForwarder][NET] %s", cleanMsg.c_str());
+                gEngfuncs.Con_Printf("[CF] [NET] %s", cleanMsg.c_str());
             }
             QueueTask(MSG_TYPE_NET, cleanMsg);
         }
@@ -77,7 +78,7 @@ void __MsgFunc_StuffText(void) {
         std::string cleanMsg = CleanMessage(psz);
         if (!cleanMsg.empty()) {
             if (IsCvarValid(cf_debug) && atoi(cf_debug->string) > 0) {
-                gEngfuncs.Con_Printf("[ChatForwarder][STUFF] %s", cleanMsg.c_str());
+                gEngfuncs.Con_Printf("[CF] [STUFF] %s", cleanMsg.c_str());
             }
             QueueTask(MSG_TYPE_STUFF, cleanMsg);
         }
@@ -106,13 +107,8 @@ void HUD_Init(void) {
 }
 
 void HUD_Frame(double time) {
+    NetDiag_Frame();
     g_netConfig.enabled.store(IsCvarValid(cf_enabled) && atoi(cf_enabled->string) != 0, std::memory_order_relaxed);
-    if (IsCvarValid(cf_server_ip) && IsCvarValid(cf_server_port)) {
-        std::lock_guard<std::mutex> lock(g_netConfig.mtx);
-        strncpy_s(g_netConfig.server_ip, cf_server_ip->string, sizeof(g_netConfig.server_ip) - 1);
-        g_netConfig.port = atoi(cf_server_port->string);
-        g_netConfig.valid = true;
-    }
 
     auto now = std::chrono::steady_clock::now();
     double delay = IsCvarValid(cf_command_delay) ? (double)cf_command_delay->value : 0.0;
@@ -128,7 +124,7 @@ void HUD_Frame(double time) {
 
                 if (!message.empty()) {
                     if (IsCvarValid(cf_debug) && atoi(cf_debug->string) > 0) {
-                        gEngfuncs.Con_Printf("[ChatForwarder] Executing: %s\n", message.c_str());
+                        gEngfuncs.Con_Printf("[CF] Executing: %s\n", message.c_str());
                     }
                     message += '\n';
                     gEngfuncs.pfnClientCmd(message.c_str());
@@ -138,6 +134,16 @@ void HUD_Frame(double time) {
         }
     }
     if (g_pfnHUD_Frame) g_pfnHUD_Frame(time);
+}
+
+int HUD_GetStudioModelInterface(int version, struct r_studio_interface_s **ppinterface, struct engine_studio_api_s *pstudio) {
+    if (pstudio) {
+        memcpy(&g_engineStudio, pstudio, sizeof(g_engineStudio));
+    }
+    if (g_pfnHUD_GetStudioModelInterface) {
+        return g_pfnHUD_GetStudioModelInterface(version, ppinterface, pstudio);
+    }
+    return 0;
 }
 
 int __MsgFunc_SayText(const char* pszName, int iSize, void* pbuf) {
@@ -154,7 +160,7 @@ int __MsgFunc_SayText(const char* pszName, int iSize, void* pbuf) {
     memcpy(temp_buf, pbuf, iSize);
 
     BEGIN_READ(temp_buf, iSize);
-    READ_BYTE(); // client index
+    int client_index = READ_BYTE(); // client index
 
     char* msg_base = READ_STRING();
     std::string fullMsg = msg_base ? CleanMessage(msg_base) : "";
@@ -170,12 +176,55 @@ int __MsgFunc_SayText(const char* pszName, int iSize, void* pbuf) {
     }
 
     if (!fullMsg.empty()) {
-        if (IsCvarValid(cf_debug) && atoi(cf_debug->string) > 0) {
-            gEngfuncs.Con_Printf("[ChatForwarder][CHAT] %s\n", fullMsg.c_str());
+        // Resolve author's SteamID
+        uint64_t authorSteamID = 0;
+        const char* idSrc = "none";
+        static const bool isSven = (g_pMetaHookAPI && g_pMetaHookAPI->GetEngineType() == ENGINE_SVENGINE);
+        const int maxClients = (gEngfuncs.GetMaxClients && gEngfuncs.GetMaxClients() > 0) ? gEngfuncs.GetMaxClients() : 32;
+        const bool validClient = (client_index > 0 && client_index <= maxClients);
+
+        // 1. Try engine studio interface on Sven Co-op (player_info_sc_t)
+        if (isSven && validClient && g_engineStudio.PlayerInfo) {
+            auto* sc_info = (player_info_sc_t*)g_engineStudio.PlayerInfo(client_index - 1);
+            if (sc_info && sc_info->m_nSteamID != 0) {
+                authorSteamID = sc_info->m_nSteamID;
+                idSrc = "studio";
+            }
         }
-        // Only CHAT carries the local player's SteamID — this is the one message
-        // the local player actually sent. All other types get steamid=0 (default).
-        QueueTask(MSG_TYPE_CHAT, fullMsg, GetLocalSteamID64());
+
+        // 2. Fallback to hud_player_info_t (standard GoldSrc)
+        if (authorSteamID == 0 && validClient && gEngfuncs.pfnGetPlayerInfo) {
+            hud_player_info_t info = {};
+            gEngfuncs.pfnGetPlayerInfo(client_index, &info);
+            if (info.m_nSteamID != 0) {
+                authorSteamID = info.m_nSteamID;
+                idSrc = "hud";
+            }
+        }
+
+        // 3. Fallback to local player SteamID for own messages
+        if (authorSteamID == 0) {
+            cl_entity_t* localPlayer = gEngfuncs.GetLocalPlayer ? gEngfuncs.GetLocalPlayer() : nullptr;
+            if (localPlayer && localPlayer->index == client_index) {
+                authorSteamID = GetLocalSteamID64();
+                if (authorSteamID != 0) {
+                    idSrc = "local";
+                }
+            }
+        }
+
+        if (authorSteamID != 0) {
+            CSteamID sid(authorSteamID);
+            if (!sid.IsValid() || !sid.BIndividualAccount()) {
+                authorSteamID = 0;
+            }
+        }
+
+        if (IsCvarValid(cf_debug) && atoi(cf_debug->string) > 0) {
+            gEngfuncs.Con_Printf("[CF] [CHAT] (client %d, steamid %llu, src %s) %s\n",
+                client_index, (unsigned long long)authorSteamID, idSrc, fullMsg.c_str());
+        }
+        QueueTask(MSG_TYPE_CHAT, fullMsg, authorSteamID);
     }
 
     return callOriginal();
@@ -209,7 +258,7 @@ int __MsgFunc_TextMsg(const char* pszName, int iSize, void* pbuf) {
         }
         if (!fullMsg.empty()) {
             if (IsCvarValid(cf_debug) && atoi(cf_debug->string) > 0) {
-                gEngfuncs.Con_Printf("[ChatForwarder][GAME] %s\n", fullMsg.c_str());
+                gEngfuncs.Con_Printf("[CF] [GAME] %s\n", fullMsg.c_str());
             }
             QueueTask(MSG_TYPE_GAME, fullMsg);
         }
