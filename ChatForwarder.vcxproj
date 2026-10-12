@@ -153,12 +153,14 @@
     <ClCompile Include="..\..\include\HLSDK\common\interface.cpp" />
     <ClCompile Include="..\..\include\HLSDK\common\parsemsg.cpp" />
     <ClCompile Include="exportfuncs.cpp" />
+    <ClCompile Include="netdiag.cpp" />
     <ClCompile Include="plugins.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\include\HLSDK\common\interface.h" />
     <ClInclude Include="..\..\include\HLSDK\common\parsemsg.h" />
     <ClInclude Include="exportfuncs.h" />
+    <ClInclude Include="netdiag.h" />
     <ClInclude Include="plugins.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
